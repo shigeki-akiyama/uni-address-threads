@@ -1,0 +1,13 @@
+
+dir=$(cd $(dirname $0); pwd)
+
+$dir/configure \
+    --host=sparc64-unknown-linux \
+    --with-comm-layer=fx10 \
+    MPICC=mpigccpx \
+    MPICXX=mpig++px \
+    CXXFLAGS="-g -O3 -I/opt/FJSVXosArmci/include" \
+    LDFLAGS="-L/opt/FJSVXosArmci/lib64" \
+    CPPFLAGS="-I/opt/FJSVXosArmci/include" \
+    "$@"
+

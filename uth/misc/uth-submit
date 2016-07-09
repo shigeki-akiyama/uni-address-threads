@@ -1,0 +1,417 @@
+#!/usr/bin/env ocaml
+#load "str.cma"
+#load "unix.cma"
+
+let (@@) f x = f x
+let (|>) x f = f x
+let (|-) g f x = f (g x)
+let (-|) f g x = f (g x)
+
+let undefined () = failwith "undefined"
+
+let printf = Printf.printf
+let sprintf = Printf.sprintf
+let (%%) = Printf.sprintf
+let (%) f x = f x
+let (=~) s r = Str.string_match (Str.regexp r) s 0
+
+
+module String = struct
+  include String
+  include Str
+
+  let quote s = sprintf "'%s'" s
+
+  let double_quote s = sprintf "\"%s\"" s
+end
+module S = String
+
+module Option = struct
+  type 'a t = 'a option
+
+  let default v = function
+    | None -> v
+    | Some x -> x
+end
+
+module Filename = struct
+  include Filename
+
+  module Infix = struct
+    let (</>) = Filename.concat
+  end
+  open Infix
+
+  let abspath fname =
+    let cwd = Sys.getcwd () in
+    let base = basename fname in
+    Sys.chdir (dirname fname);
+    let dir = Sys.getcwd () in
+    Sys.chdir cwd;
+    dir </> base
+end
+
+module Datetime = struct
+  open Unix
+
+  let unix_time () = Unix.time ()
+
+  let time () = Unix.localtime (unix_time ())
+
+  let date_string fmt =
+    let d = time () in
+    fmt %% (d.tm_year mod 100) % (d.tm_mon + 1) % d.tm_mday
+
+  let datetime_string ?mod_year fmt =
+    let mod_year = Option.default max_int mod_year in
+    let d = time () in
+    fmt %% (d.tm_year mod mod_year) % (d.tm_mon + 1) % d.tm_mday %
+      d.tm_hour % d.tm_min % d.tm_sec
+end
+
+module UnixExt = struct
+  open Unix
+
+  let username () =
+    let pw = getpwuid (getuid ()) in
+    pw.pw_name
+end
+
+
+module L = List
+open Filename.Infix
+
+(******************************************************************************)
+
+type steal_type = PlainWS | Backoff | RBackoff | Lifeline
+
+let string_of_steal_type = function
+  | PlainWS -> "plain"
+  | Backoff -> "backoff"
+  | RBackoff -> "rbackoff"
+  | Lifeline -> "lifeline"
+
+let steal_type_of_string = function
+  | "plain" -> PlainWS
+  | "backoff" -> Backoff
+  | "rbackoff" -> RBackoff
+  | "lifeline" -> Lifeline
+  | _ -> failwith "invalid steal type"
+
+module Options = struct
+  open Arg
+
+  type t = {
+    app : string;
+    params : string;
+    trials : int;
+    nps : int list;
+    mparams : string;
+    token : string;
+    job_queue : string;
+    job_np : int;
+    job_time : string;
+    dry_run : bool;
+  }
+
+  let value = ref {
+    app = "";
+    params = "";
+    trials = 1;
+    nps = [];
+    mparams = "";
+    token = "t2g-13IAD";
+    job_queue = "";
+    job_np = 0;
+    job_time = "";
+    dry_run = false;
+  }
+
+  let to_string v =
+    "{ app = %s; params = %s; trials = %d; nps = %s; \
+       mparams = %s; token = %s; job_queue = %s; \
+       job_np = %d; job_time = %s" %%
+      v.app % v.params % v.trials %
+      (S.concat "," @@ L.map string_of_int v.nps) %
+      v.mparams %
+      v.token % v.job_queue % v.job_np % v.job_time
+
+  let parse_string_list = S.split (S.regexp ",")
+  let parse_int_list s = L.map int_of_string @@ parse_string_list s
+
+  let usage_msg = "Usage: %s [options]" %% Sys.argv.(0)
+
+  let speclist = [
+    "-app",
+    String (fun s -> value := { !value with app = s }),
+    "<name>";
+
+    "-params",
+    String (fun s -> value := { !value with params = s }),
+    "<parameter list>  application parameter list";
+
+    "-trials",
+    Int (fun n -> value := { !value with trials = n }),
+    "<N>  the number of trials";
+
+    "-nps",
+    String (fun s -> value := { !value with nps = parse_int_list s }),
+    "<list>  a list of the number of cores";
+
+    "-mparams",
+    String (fun s -> value := { !value with mparams = s }),
+    "<MADM parameter list>  MassiveThreads/DM env parameters";
+
+    "-token",
+    String (fun s -> value := { !value with token = s }),
+    "<token>  a token (group ID, etc.) for job submission";
+
+    "-queue",
+    String (fun s -> value := { !value with job_queue = s }),
+    "<queue name>  job queue";
+
+    "-jobnp", Int (fun n -> value := { !value with job_np = n }),
+    "<N>  the number of cores of the job";
+
+    "-time",
+    String (fun s -> value := { !value with job_time = s }),
+    "<time>  expected job time";
+
+    "-dry",
+    Unit (fun () -> value := { !value with dry_run = true }),
+    "  dry run"
+  ]
+
+  let parse_args () =
+    try
+      parse_argv Sys.argv speclist (fun _ -> ()) usage_msg;
+      !value
+    with
+    | Help s ->
+      prerr_endline s;
+      exit 1
+    | Bad s ->
+      prerr_endline s;
+      exit 1
+end
+
+let expand_params text =
+  let length = S.length text in
+
+  let rec parse idx =
+    if idx = length then
+      idx, []
+    else
+      match text.[idx] with
+      | ',' | '}' ->
+        idx, []
+      | '{' ->
+        let idx, ss = parse_choice (idx + 1) in
+
+        if idx = length || text.[idx] <> '}' then
+          failwith "parse error";
+
+        begin match parse (idx + 1) with
+        | idx, [] ->
+          idx, ss
+        | idx, ss' ->
+          idx, L.concat @@ L.map (fun s -> L.map (fun s' -> s ^ s') ss') ss
+        end
+
+      | c ->
+        let idx, s = parse_string idx in
+        match parse idx with
+        | idx, [] -> idx, [s]
+        | idx, ss -> idx, L.map (fun s' -> s ^ s') ss
+
+  and concat_chars cs =
+    let len = L.length cs in
+    let s = String.create len in
+    L.iteri (fun i c -> s.[i] <- c) cs;
+    s
+
+  and parse_string idx =
+    let rec loop idx acc =
+      if idx = length then
+        idx, concat_chars (L.rev acc)
+      else
+        match text.[idx] with
+        | '{' | '}' | ',' ->
+          idx, concat_chars (L.rev acc)
+        | c ->
+          loop (idx + 1) (c :: acc)
+    in
+    loop idx []
+      |> fun (idx', s) ->
+        idx', s
+
+  and parse_choice idx =
+    let rec loop idx acc =
+      let idx, ss = parse idx in
+      if idx = length then
+        idx, L.concat @@ L.rev (ss :: acc)
+      else
+        match text.[idx] with
+        | '}' ->
+          idx, L.concat @@ L.rev (ss :: acc)
+        | ',' ->
+          loop (idx + 1) (ss :: acc)
+        | _ ->
+          failwith "parse error"
+    in
+    loop idx []
+  in
+
+  let _, ss = parse 0 in
+  ss
+
+open Options
+
+
+let make_base_dir () =
+  let exec_path = Filename.abspath Sys.argv.(0) in
+  Filename.dirname exec_path </> ".."
+
+let make_data_dir base_dir app machine date =
+  base_dir </> "examples" </> app </> "data" </> machine </> date
+
+let make_script_path dir =
+  let datetime =
+    Datetime.datetime_string ~mod_year:100 "%02d%02d%02d-%02d%02d%02d"
+  in
+  let filename = ".uth-submit.%s.sub" %% datetime in
+  dir </> filename
+
+let make_uth_params opt =
+  opt.mparams
+  |> expand_params
+  |> L.map
+      (S.split (S.regexp " ")
+          |- L.map (sprintf "-x MADM_%s")
+          |- S.concat " ")
+  |> L.map S.double_quote
+(*  |> begin function 
+      | [] -> ["-x DUMMY=0"]
+      | xs -> xs
+     end*)
+  |> S.concat "\n"
+
+let make_sweep_params opt =
+  opt.params
+  |> expand_params
+  |> L.map S.double_quote
+  |> S.concat "\n"
+
+let speculate_machine () =
+  match UnixExt.username () with
+  | "c64003" -> "oakleaf-fx"
+  | "12IAH358" -> "tsubame"
+  | _ ->
+    let hostname = Unix.gethostname () in
+    match
+      L.filter (fun prefix -> hostname =~ prefix) [
+        "oooka";
+        "hosei";
+      ]
+    with
+    | [] -> hostname
+    | prefix :: _ -> prefix
+
+let make_qsub_header machine opt =
+  if opt.job_np <= 0 then
+    "", "", ""
+  else
+    match machine with
+    | "oakleaf-fx" -> "pjsub", "", ""
+    | "tsubame" -> "t2sub", "", opt.token
+    | _ -> "qsub", "", ""
+
+
+let main () =
+  (* parse options *)
+  let opt = Options.parse_args () in
+
+  (* parameters *)
+  let base_dir = make_base_dir () in
+  let app = opt.app in
+  let nps = S.concat " " @@ L.map string_of_int opt.nps in
+  let uth_params = make_uth_params opt in
+  let sweep_params = make_sweep_params opt in
+  let trials = string_of_int opt.trials in
+  let machine = speculate_machine () in
+  let date = Datetime.date_string "%02d%02d%02d" in
+
+  let sub, qsub_header, token = make_qsub_header machine opt in
+  let queue = opt.job_queue in
+  let job_np = string_of_int opt.job_np in
+  let job_time = opt.job_time in
+
+  let hostname = Unix.gethostname () in
+
+  let dry_run = if opt.dry_run then "1" else "" in
+
+  (* make directory *)
+  let data_dir = make_data_dir base_dir app machine date in
+  ignore @@ Unix.system ("mkdir -p %s" %% data_dir);
+
+  (* open in/out files *)
+  let inpath = base_dir </> "misc" </> "uth-submit-template.sh" in
+  let outpath = make_script_path data_dir in
+  let infile = open_in inpath in
+  let outfile = open_out outpath in
+  begin
+    try
+      while true do
+        let line = input_line infile in
+        let line = L.fold_left
+          (fun acc (from, to_) -> S.global_replace (S.regexp from) to_ acc)
+          line
+          [
+            "@@BASEDIR@@", base_dir;
+            "@@APP@@", app;
+            "@@NPS@@", nps;
+            "@@MADM_PARAMS@@", uth_params;
+            "@@SWEEP_PARAMS@@", sweep_params;
+            "@@TRIALS@@", trials;
+            "@@MACHINE@@", machine;
+            "@@DATE@@", date;
+            "@@DRYRUN@@", dry_run;
+
+            "@@SUB@@", sub;
+            "@@TOKEN@@", token;
+            "@@JOBQUEUE@@", queue;
+            "@@JOBNP@@", job_np;
+            "@@JOBTIME@@", job_time;
+            "@@SUB_HEADER@@", qsub_header;
+            "@@HOSTNAME@@", hostname;
+          ]
+        in
+        output_string outfile (line ^ "\n")
+      done
+    with
+    | End_of_file ->
+      close_in infile;
+      close_out outfile
+  end;
+
+  (* for job submission system on TSUBAME *)
+  Unix.chmod outpath 0o740;
+
+  let cmd = "bash %s" %% outpath in
+  let r = Unix.system cmd in
+
+  begin match opt.dry_run, r with
+  | false, Unix.WEXITED r when r = 0 ->
+    ()
+  | _ ->
+    Sys.remove outpath
+  end
+
+
+let () =
+  try
+    main ()
+  with
+  | e ->
+    prerr_endline (Printexc.to_string e);
+    Printexc.print_backtrace stdout
